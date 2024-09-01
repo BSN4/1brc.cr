@@ -17,6 +17,7 @@ module OneBRCParallel
   BUF_DIV = (ENV["BUF_DIV_DENOM"]? || 8).to_i
   PART_MAX = Int32::MAX // BUF_DIV
   PART_XTRA = 32
+
   class FileProcessor
     @part_size : Int32
     @file_parts : Int32
@@ -65,24 +66,84 @@ module OneBRCParallel
     end
   end
 
+  class BufferReader
+    include OneBRC
+    def initialize(@ptr : UInt8*, @size : Int32)
+    end
+
+    def find_line_start(read_pos)
+      until @ptr[read_pos].ascii_newline?
+        read_pos &+= 1
+      end
+      read_pos &+ 1
+    end
+
+    def find_next_line(read_pos)
+      until @ptr[read_pos].ascii_newline?
+        read_pos &+= 1
+      end
+      read_pos &+ 1
+    end
+
+    def read_until_separator(read_pos)
+      start = read_pos
+      while @ptr[read_pos] != ';'.ord
+        read_pos &+= 1
+      end
+      {Bytes.new(@ptr + start, read_pos - start), read_pos &+ 1}
+    end
+
+    def unsafe_byte_at(pos)
+      @ptr[pos]
+    end
+  end
+
+  module FastParse
+    include OneBRC
+    extend self
+
+    def parse_temperature(reader : BufferReader, read_pos)
+      ptr = reader.unsafe_byte_at(read_pos)
+      numval = if ptr == '-'.ord
+                 read_pos &+= 1
+                 FixPointInt.new(-1)
+               else
+                 FixPointInt.new(1)
+               end
+
+      d1 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
+      __expect_digit(reader.unsafe_byte_at(read_pos))
+
+      numval *= if reader.unsafe_byte_at(read_pos &+ 1) == '.'.ord
+                  read_pos &+= 2
+                  d2 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
+                  __expect_digit(reader.unsafe_byte_at(read_pos))
+                  TEMP10 &* d1 &+ d2
+                else
+                  d2 = reader.unsafe_byte_at(read_pos &+ 1) &- ZERO_ORD
+                  __expect_digit(reader.unsafe_byte_at(read_pos &+ 1))
+                  read_pos &+= 3
+                  d3 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
+                  __expect_digit(reader.unsafe_byte_at(read_pos))
+                  TEMP100 &* d1 &+ TEMP10 &* d2 &+ d3
+                end
+
+      {numval, read_pos}
+    end
+  end
+
   module DataProcessor
     include OneBRC
     extend self
 
     def process(ix : Int32, ofs : Int64, size : Int32, buf : Bytes, aggr : Collector)
-      ptr = buf.to_unsafe
-      read_pos = ofs > 0 ? find_line_start(ptr, 0) : 0
+      reader = BufferReader.new(buf.to_unsafe, size)
+      read_pos = ofs > 0 ? reader.find_line_start(0) : 0
 
       while read_pos < size
-        start = read_pos
-        while ptr[read_pos] != ';'.ord
-          read_pos &+= 1
-        end
-        name = buf[start, read_pos - start]
-        read_pos &+= 1 # skip ';'
-
-        numval = parse_temperature(ptr, read_pos)
-        read_pos = find_next_line(ptr, read_pos)
+        name, read_pos = reader.read_until_separator(read_pos)
+        numval, read_pos = FastParse.parse_temperature(reader, read_pos)
+        read_pos = reader.find_next_line(read_pos)
 
         if (rec = aggr[name]?)
           rec.add(numval)
@@ -93,48 +154,6 @@ module OneBRCParallel
     rescue ex
       STDERR.puts "Error processing chunk #{ix}: #{ex.message}"
       STDERR.puts ex.backtrace.join("\n")
-    end
-
-    private def find_line_start(ptr, read_pos)
-      until ptr[read_pos].ascii_newline?
-        read_pos &+= 1
-      end
-      read_pos &+ 1
-    end
-
-    private def find_next_line(ptr, read_pos)
-      until ptr[read_pos].ascii_newline?
-        read_pos &+= 1
-      end
-      read_pos &+ 1
-    end
-
-    private def parse_temperature(ptr, read_pos)
-      numval = if ptr[read_pos] == '-'.ord
-                 read_pos &+= 1
-                 FixPointInt.new(-1)
-               else
-                 FixPointInt.new(1)
-               end
-
-      d1 = ptr[read_pos] &- ZERO_ORD
-      __expect_digit(ptr[read_pos])
-
-      numval *= if ptr[read_pos &+ 1] == '.'.ord
-                  read_pos &+= 2
-                  d2 = ptr[read_pos] &- ZERO_ORD
-                  __expect_digit(ptr[read_pos])
-                  TEMP10 &* d1 &+ d2
-                else
-                  d2 = ptr[read_pos &+ 1] &- ZERO_ORD
-                  __expect_digit(ptr[read_pos &+ 1])
-                  read_pos &+= 3
-                  d3 = ptr[read_pos] &- ZERO_ORD
-                  __expect_digit(ptr[read_pos])
-                  TEMP100 &* d1 &+ TEMP10 &* d2 &+ d3
-                end
-
-      numval
     end
   end
 
