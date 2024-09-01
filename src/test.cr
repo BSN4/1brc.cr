@@ -17,10 +17,10 @@ module OneBRCParallel
   BUF_DIV = (ENV["BUF_DIV_DENOM"]? || 8).to_i
   PART_MAX = Int32::MAX // BUF_DIV
   PART_XTRA = 32
-
   class FileProcessor
     @part_size : Int32
     @file_parts : Int32
+
     def initialize(@file_path : String)
       @file = File.new(@file_path, "r")
       @file_size = @file.size
@@ -29,10 +29,11 @@ module OneBRCParallel
       @file_parts = calculate_file_parts
     end
 
-    def process(&block : Int32, Int64, Int32, Bytes -> Nil)
+    def process(coll_chan : Channel(Collector))
       PARALLEL_MAX.times do |p_ix|
         spawn do
           back_buf = Bytes.new(@part_size + PART_XTRA)
+          aggr = Collector.new
           p_ix.step(to: @file_parts - 1, by: PARALLEL_MAX) do |ix|
             ofs = ix.to_i64 * @part_size
             size = if ofs + @part_size < @file_size
@@ -44,8 +45,9 @@ module OneBRCParallel
             buf_size = size < @part_size ? size : size + PART_XTRA
             buf = back_buf[0, buf_size]
             @file.read_at(offset: ofs, bytesize: buf_size) { |io| io.read_fully(buf) }
-            block.call(ix, ofs, size.to_i32, buf)
+            DataProcessor.process(ix, ofs, size.to_i32, buf, aggr)
           end
+          coll_chan.send aggr
         end
       end
     end
@@ -63,13 +65,11 @@ module OneBRCParallel
     end
   end
 
-  class DataProcessor
+  module DataProcessor
     include OneBRC
-    def initialize
-      @aggr = Collector.new
-    end
+    extend self
 
-    def process(ix : Int32, ofs : Int64, size : Int32, buf : Bytes)
+    def process(ix : Int32, ofs : Int64, size : Int32, buf : Bytes, aggr : Collector)
       ptr = buf.to_unsafe
       read_pos = ofs > 0 ? find_line_start(ptr, 0) : 0
 
@@ -84,19 +84,15 @@ module OneBRCParallel
         numval = parse_temperature(ptr, read_pos)
         read_pos = find_next_line(ptr, read_pos)
 
-        if (rec = @aggr[name]?)
+        if (rec = aggr[name]?)
           rec.add(numval)
         else
-          @aggr[name.dup] = Metric.new(numval)
+          aggr[name.dup] = Metric.new(numval)
         end
       end
     rescue ex
       STDERR.puts "Error processing chunk #{ix}: #{ex.message}"
       STDERR.puts ex.backtrace.join("\n")
-    end
-
-    def result
-      @aggr
     end
 
     private def find_line_start(ptr, read_pos)
@@ -146,11 +142,7 @@ module OneBRCParallel
     file_processor = FileProcessor.new(input_file)
     coll_chan = Channel(Collector).new
 
-    file_processor.process do |ix, ofs, size, buf|
-      data_processor = DataProcessor.new
-      data_processor.process(ix, ofs, size, buf)
-      coll_chan.send data_processor.result
-    end
+    file_processor.process(coll_chan)
 
     aggr = Collector.new
     PARALLEL_MAX.times do
