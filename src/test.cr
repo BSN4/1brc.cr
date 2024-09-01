@@ -98,56 +98,67 @@ module OneBRCParallel
     end
   end
 
+  alias ParseState = {BufferReader, Int32, FixPointInt, FixPointInt}
+
   module ParserChain
     include OneBRC
     extend self
 
-    def read_sign(reader, read_pos, value, sign)
+    def init(reader : BufferReader, read_pos : Int32) : ParseState
+      {reader, read_pos, FixPointInt.new(0), FixPointInt.new(1)}
+    end
+
+    def read_sign(state : ParseState) : ParseState
+      reader, read_pos, value, sign = state
       if reader.unsafe_byte_at(read_pos) == '-'.ord
         read_pos &+= 1
         sign = FixPointInt.new(-1)
       end
-      {read_pos, value, sign}
+      {reader, read_pos, value, sign}
     end
 
-    def read_digit(reader, read_pos, value)
+    def read_digit(state : ParseState) : ParseState
+      reader, read_pos, value, sign = state
       d = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
       __expect_digit(reader.unsafe_byte_at(read_pos))
       value = value * TEMP10 &+ d
       read_pos &+= 1
-      {read_pos, value}
+      {reader, read_pos, value, sign}
     end
 
-    def skip_char(read_pos)
-      read_pos &+= 1
-      read_pos
+    def skip_char(state : ParseState) : ParseState
+      reader, read_pos, value, sign = state
+      {reader, read_pos &+ 1, value, sign}
     end
 
-    def maybe_decimal(reader, read_pos, value)
+    def maybe_decimal(state : ParseState) : ParseState
+      reader, read_pos, value, sign = state
       if reader.unsafe_byte_at(read_pos) == '.'.ord
-        read_pos = skip_char(read_pos)
-        read_pos, value = read_digit(reader, read_pos, value)
+        state = skip_char(state)
+        state = read_digit(state)
       else
-        read_pos, value = read_digit(reader, read_pos, value)
-        read_pos = skip_char(read_pos)
-        read_pos, value = read_digit(reader, read_pos, value)
+        state = read_digit(state)
+        state = skip_char(state)
+        state = read_digit(state)
       end
-      {read_pos, value}
+      state
+    end
+
+    def finalize(state : ParseState) : {FixPointInt, Int32}
+      reader, read_pos, value, sign = state
+      {sign * value, read_pos}
     end
   end
 
   module FastParse
     extend self
 
-    def parse_temperature(reader : BufferReader, read_pos)
-      value = FixPointInt.new(0)
-      sign = FixPointInt.new(1)
-
-      read_pos, value, sign = ParserChain.read_sign(reader, read_pos, value, sign)
-      read_pos, value = ParserChain.read_digit(reader, read_pos, value)
-      read_pos, value = ParserChain.maybe_decimal(reader, read_pos, value)
-
-      {sign * value, read_pos}
+    def parse_temperature(reader : BufferReader, read_pos : Int32) : Tuple(FixPointInt, Int32)
+       ParserChain.init(reader, read_pos)
+        .try { |state| ParserChain.read_sign(state) }
+        .try { |state| ParserChain.read_digit(state) }
+        .try { |state| ParserChain.maybe_decimal(state) }
+        .try { |state| ParserChain.finalize(state) }
     end
   end
 
