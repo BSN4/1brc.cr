@@ -98,37 +98,56 @@ module OneBRCParallel
     end
   end
 
-  module FastParse
+  module ParserChain
     include OneBRC
     extend self
 
-    def parse_temperature(reader : BufferReader, read_pos)
-      ptr = reader.unsafe_byte_at(read_pos)
-      numval = if ptr == '-'.ord
-                 read_pos &+= 1
-                 FixPointInt.new(-1)
-               else
-                 FixPointInt.new(1)
-               end
+    def read_sign(reader, read_pos, value, sign)
+      if reader.unsafe_byte_at(read_pos) == '-'.ord
+        read_pos &+= 1
+        sign = FixPointInt.new(-1)
+      end
+      {read_pos, value, sign}
+    end
 
-      d1 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
+    def read_digit(reader, read_pos, value)
+      d = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
       __expect_digit(reader.unsafe_byte_at(read_pos))
+      value = value * TEMP10 &+ d
+      read_pos &+= 1
+      {read_pos, value}
+    end
 
-      numval *= if reader.unsafe_byte_at(read_pos &+ 1) == '.'.ord
-                  read_pos &+= 2
-                  d2 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
-                  __expect_digit(reader.unsafe_byte_at(read_pos))
-                  TEMP10 &* d1 &+ d2
-                else
-                  d2 = reader.unsafe_byte_at(read_pos &+ 1) &- ZERO_ORD
-                  __expect_digit(reader.unsafe_byte_at(read_pos &+ 1))
-                  read_pos &+= 3
-                  d3 = reader.unsafe_byte_at(read_pos) &- ZERO_ORD
-                  __expect_digit(reader.unsafe_byte_at(read_pos))
-                  TEMP100 &* d1 &+ TEMP10 &* d2 &+ d3
-                end
+    def skip_char(read_pos)
+      read_pos &+= 1
+      read_pos
+    end
 
-      {numval, read_pos}
+    def maybe_decimal(reader, read_pos, value)
+      if reader.unsafe_byte_at(read_pos) == '.'.ord
+        read_pos = skip_char(read_pos)
+        read_pos, value = read_digit(reader, read_pos, value)
+      else
+        read_pos, value = read_digit(reader, read_pos, value)
+        read_pos = skip_char(read_pos)
+        read_pos, value = read_digit(reader, read_pos, value)
+      end
+      {read_pos, value}
+    end
+  end
+
+  module FastParse
+    extend self
+
+    def parse_temperature(reader : BufferReader, read_pos)
+      value = FixPointInt.new(0)
+      sign = FixPointInt.new(1)
+
+      read_pos, value, sign = ParserChain.read_sign(reader, read_pos, value, sign)
+      read_pos, value = ParserChain.read_digit(reader, read_pos, value)
+      read_pos, value = ParserChain.maybe_decimal(reader, read_pos, value)
+
+      {sign * value, read_pos}
     end
   end
 
