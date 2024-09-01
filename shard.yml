@@ -9,6 +9,8 @@ targets:
     main: src/1brc_parallel_mmap3.cr
   1brc_parallel_ptr4:
     main: src/1brc_parallel_ptr4.cr
+  test:
+    main: src/test.cr
   1brc_parallel_mmap2b:
     main: src/1brc_parallel_mmap2b.cr
   1brc_parallel_ptr3b:

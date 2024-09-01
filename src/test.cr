@@ -1,0 +1,173 @@
+require "./1brc/output"
+require "./1brc/macros"
+require "./1brc/stat"
+
+module OneBRCParallel
+  include OneBRC
+  extend self
+
+  alias FixPointInt = Int16
+  alias Metric = Stat(FixPointInt, Int64)
+  alias Collector = Hash(Bytes, Metric)
+
+  TEMP10  = FixPointInt.new(10)
+  TEMP100 = FixPointInt.new(100)
+  PARALLEL_MAX = (ENV["CRYSTAL_WORKERS"]? || 4).to_i
+  ZERO_ORD = UInt8.new('0'.ord)
+  BUF_DIV = (ENV["BUF_DIV_DENOM"]? || 8).to_i
+  PART_MAX = Int32::MAX // BUF_DIV
+  PART_XTRA = 32
+
+  class FileProcessor
+    @part_size : Int32
+    @file_parts : Int32
+    def initialize(@file_path : String)
+      @file = File.new(@file_path, "r")
+      @file_size = @file.size
+      @page_size = LibC.sysconf(LibC::SC_PAGESIZE)
+      @part_size = calculate_part_size
+      @file_parts = calculate_file_parts
+    end
+
+    def process(&block : Int32, Int64, Int32, Bytes -> Nil)
+      PARALLEL_MAX.times do |p_ix|
+        spawn do
+          back_buf = Bytes.new(@part_size + PART_XTRA)
+          p_ix.step(to: @file_parts - 1, by: PARALLEL_MAX) do |ix|
+            ofs = ix.to_i64 * @part_size
+            size = if ofs + @part_size < @file_size
+                     @part_size
+                   else
+                     @file_size - ofs
+                   end
+
+            buf_size = size < @part_size ? size : size + PART_XTRA
+            buf = back_buf[0, buf_size]
+            @file.read_at(offset: ofs, bytesize: buf_size) { |io| io.read_fully(buf) }
+            block.call(ix, ofs, size.to_i32, buf)
+          end
+        end
+      end
+    end
+
+    private def calculate_part_size
+      part_size = PART_MAX
+      unless (rem = part_size % @page_size).zero?
+        part_size += @page_size - rem
+      end
+      part_size
+    end
+
+    private def calculate_file_parts
+      (@file_size // @part_size).to_i32 + (@file_size % @part_size).clamp(0, 1).to_i32
+    end
+  end
+
+  class DataProcessor
+    include OneBRC
+    def initialize
+      @aggr = Collector.new
+    end
+
+    def process(ix : Int32, ofs : Int64, size : Int32, buf : Bytes)
+      ptr = buf.to_unsafe
+      read_pos = ofs > 0 ? find_line_start(ptr, 0) : 0
+
+      while read_pos < size
+        start = read_pos
+        while ptr[read_pos] != ';'.ord
+          read_pos &+= 1
+        end
+        name = buf[start, read_pos - start]
+        read_pos &+= 1 # skip ';'
+
+        numval = parse_temperature(ptr, read_pos)
+        read_pos = find_next_line(ptr, read_pos)
+
+        if (rec = @aggr[name]?)
+          rec.add(numval)
+        else
+          @aggr[name.dup] = Metric.new(numval)
+        end
+      end
+    rescue ex
+      STDERR.puts "Error processing chunk #{ix}: #{ex.message}"
+      STDERR.puts ex.backtrace.join("\n")
+    end
+
+    def result
+      @aggr
+    end
+
+    private def find_line_start(ptr, read_pos)
+      until ptr[read_pos].ascii_newline?
+        read_pos &+= 1
+      end
+      read_pos &+ 1
+    end
+
+    private def find_next_line(ptr, read_pos)
+      until ptr[read_pos].ascii_newline?
+        read_pos &+= 1
+      end
+      read_pos &+ 1
+    end
+
+    private def parse_temperature(ptr, read_pos)
+      numval = if ptr[read_pos] == '-'.ord
+                 read_pos &+= 1
+                 FixPointInt.new(-1)
+               else
+                 FixPointInt.new(1)
+               end
+
+      d1 = ptr[read_pos] &- ZERO_ORD
+      __expect_digit(ptr[read_pos])
+
+      numval *= if ptr[read_pos &+ 1] == '.'.ord
+                  read_pos &+= 2
+                  d2 = ptr[read_pos] &- ZERO_ORD
+                  __expect_digit(ptr[read_pos])
+                  TEMP10 &* d1 &+ d2
+                else
+                  d2 = ptr[read_pos &+ 1] &- ZERO_ORD
+                  __expect_digit(ptr[read_pos &+ 1])
+                  read_pos &+= 3
+                  d3 = ptr[read_pos] &- ZERO_ORD
+                  __expect_digit(ptr[read_pos])
+                  TEMP100 &* d1 &+ TEMP10 &* d2 &+ d3
+                end
+
+      numval
+    end
+  end
+
+  def run(input_file : String, output_file : String? = nil)
+    file_processor = FileProcessor.new(input_file)
+    coll_chan = Channel(Collector).new
+
+    file_processor.process do |ix, ofs, size, buf|
+      data_processor = DataProcessor.new
+      data_processor.process(ix, ofs, size, buf)
+      coll_chan.send data_processor.result
+    end
+
+    aggr = Collector.new
+    PARALLEL_MAX.times do
+      next_aggr = coll_chan.receive
+      next_aggr.each do |name, in_rec|
+        if (rec = aggr[name]?)
+          rec.add(in_rec)
+        else
+          aggr[name] = in_rec
+        end
+      end
+    end
+
+    output = output_file ? File.new(output_file, "w") : STDOUT
+    write_output(output, aggr)
+    output.close unless output == STDOUT
+  end
+end
+
+OneBRCParallel.run(ARGV[0], ARGV[1]?)
